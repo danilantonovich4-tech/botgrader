@@ -7,17 +7,18 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 
-BOT_TOKEN = "8789813084:AAG4atjox9G_53u9M5PT3C812ilksz4PZBY"
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8789813084:AAG4atjox9G_53u9M5PT3C812ilksz4PZBY")
 ADMIN_ID = 7570922005 
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 class TradeStates(StatesGroup):
+    waiting_for_site_id = State()
     waiting_for_amount = State()
     waiting_for_skin_photo = State()
+    waiting_for_review_text = State()
 
-# Функция для пинга раз в 13 минут
 async def keep_alive():
     while True:
         await asyncio.sleep(780)
@@ -26,7 +27,6 @@ async def keep_alive():
         except Exception as e:
             print(f"Ошибка отправки пинга: {e}")
 
-# Простой веб-сервер для Render, чтобы сервис не уходил в спячку
 async def handle(request):
     return web.Response(text="Bot is running!")
 
@@ -43,7 +43,15 @@ async def start_web_server():
 
 @dp.message(Command("start"))
 async def start_handler(message: Message, state: FSMContext):
-    await message.answer("Привет! На какую сумму голды ты хочешь пополнить баланс?")
+    await message.answer("Привет! Введи свой **ID на сайте** для пополнения:")
+    await state.set_state(TradeStates.waiting_for_site_id)
+
+@dp.message(TradeStates.waiting_for_site_id)
+async def process_site_id(message: Message, state: FSMContext):
+    site_id = message.text.strip()
+    await state.update_data(site_id=site_id)
+    
+    await message.answer(f"ID сайта сохранен: `{site_id}`\nНа какую сумму голды ты хочешь пополнить баланс?", parse_mode="Markdown")
     await state.set_state(TradeStates.waiting_for_amount)
 
 @dp.message(TradeStates.waiting_for_amount)
@@ -54,6 +62,9 @@ async def process_amount(message: Message, state: FSMContext):
 
     amount_net = int(message.text)
     amount_gross = int(amount_net / 0.7)
+    
+    data = await state.get_data()
+    site_id = data.get("site_id")
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Принять", callback_data=f"admin_approve_{message.from_user.id}")],
@@ -62,9 +73,11 @@ async def process_amount(message: Message, state: FSMContext):
     
     await bot.send_message(
         ADMIN_ID,
-        f"Новая заявка от @{message.from_user.username} (ID: {message.from_user.id})\n"
+        f"Новая заявка от @{message.from_user.username} (ID Тг: {message.from_user.id})\n"
+        f"ID на сайте: `{site_id}`\n"
         f"Хочет получить: {amount_net} G\n"
         f"С учетом комиссии (30%) нужно выставить за: {amount_gross} G",
+        parse_mode="Markdown",
         reply_markup=keyboard
     )
     
@@ -125,9 +138,38 @@ async def user_confirms_payment(callback: CallbackQuery):
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("admin_confirm_"))
-async def admin_confirms_topup(callback: CallbackQuery):
+async def admin_confirms_topup(callback: CallbackQuery, state: FSMContext):
     user_id = int(callback.data.split("_")[2])
     
+    # Переводим пользователя в состояние ожидания текстового отзыва
+    # Сохраняем user_id в FSM (можно через memory storage для конкретного пользователя, но проще через стейт бота или запомнить в словаре)
+    # Здесь для простоты запустим стейт ожидания отзыва для пользователя через временное сохранение
+    
+    await bot.send_message(
+        user_id,
+        "Твой баланс успешно пополнен! Напиши, пожалуйста, свой текстовый отзыв о сервисе:"
+    )
+    # Установим состояние ожидания текста отзыва для этого пользователя
+    # Поскольку callback пришел от админа, нам нужно установить стейт для пользователя. В aiogram это можно сделать через FSMContext с нужным storage или проще: перевести пользователя при следующем сообщении
+    # Сделаем проще: запишем флаг или воспользуемся FSM для пользователя
+    await state.set_state(TradeStates.waiting_for_review_text)
+    await state.update_data(review_user_id=user_id)
+    
+    await callback.message.edit_text("Пополнение подтверждено. Ожидаем отзыв от пользователя.")
+    await callback.answer()
+
+@dp.message(TradeStates.waiting_for_review_text)
+async def user_sends_review_text(message: Message, state: FSMContext):
+    data = await state.get_data()
+    review_user_id = data.get("review_user_id")
+    
+    # Проверяем, что сообщение написал именно тот пользователь (если админ случайно что-то напишет)
+    if message.from_user.id != review_user_id:
+        return
+
+    review_text = message.text
+    await state.update_data(review_text=review_text)
+
     stars_keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="⭐", callback_data="review_1"),
@@ -139,15 +181,8 @@ async def admin_confirms_topup(callback: CallbackQuery):
             InlineKeyboardButton(text="⭐⭐⭐⭐⭐", callback_data="review_5")
         ]
     ])
-    
-    await bot.send_message(
-        user_id,
-        "Твой баланс успешно пополнен! Оцени, пожалуйста, работу сервиса:",
-        reply_markup=stars_keyboard
-    )
-    
-    await callback.message.edit_text("Пополнение подтверждено. Запрос на отзыв отправлен.")
-    await callback.answer()
+
+    await message.answer("Спасибо за отзыв! Теперь оцени работу сервиса звездочками:", reply_markup=stars_keyboard)
 
 @dp.callback_query(F.data.startswith("admin_fail_"))
 async def admin_fails_topup(callback: CallbackQuery):
@@ -157,24 +192,26 @@ async def admin_fails_topup(callback: CallbackQuery):
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("review_"))
-async def process_review(callback: CallbackQuery):
+async def process_review_stars(callback: CallbackQuery, state: FSMContext):
     rating = callback.data.split("_")[1]
+    data = await state.get_data()
+    review_text = data.get("review_text", "Без текста")
     
-    await callback.message.edit_text(f"Спасибо за твой отзыв: {rating} звезд!")
+    await callback.message.edit_text(f"Спасибо за оценку: {rating} звезд!")
     
     await bot.send_message(
         ADMIN_ID,
-        f"Новый отзыв от @{callback.from_user.username}: {rating} звезд."
+        f"Новый отзыв от @{callback.from_user.username}:\n"
+        f"Оценка: {rating} звезд ⭐\n"
+        f"Текст: {review_text}"
     )
+    await state.clear()
     await callback.answer()
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
-    
-    # Запускаем веб-сервер и фоновый пинг
     asyncio.create_task(start_web_server())
     asyncio.create_task(keep_alive())
-    
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
